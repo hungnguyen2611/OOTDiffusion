@@ -16,12 +16,13 @@
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from diffusers.utils.import_utils import is_xformers_available
+from einops import rearrange, repeat
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .attention_vton import BasicTransformerBlock
-
+from .attention_vton import TemporalBasicTransformerBlock
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.embeddings import ImagePositionalEmbeddings
 from diffusers.utils import USE_PEFT_BACKEND, BaseOutput, deprecate
@@ -33,47 +34,18 @@ from diffusers.models.normalization import AdaLayerNormSingle
 
 
 @dataclass
-class Transformer2DModelOutput(BaseOutput):
-    """
-    The output of [`Transformer2DModel`].
-
-    Args:
-        sample (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)` or `(batch size, num_vector_embeds - 1, num_latent_pixels)` if [`Transformer2DModel`] is discrete):
-            The hidden states output conditioned on the `encoder_hidden_states` input. If discrete, returns probability
-            distributions for the unnoised latent pixels.
-    """
-
+class Transformer3DModelOutput(BaseOutput):
     sample: torch.FloatTensor
 
 
-class Transformer2DModel(ModelMixin, ConfigMixin):
-    """
-    A 2D Transformer model for image-like data.
+if is_xformers_available():
+    import xformers
+    import xformers.ops
+else:
+    xformers = None
 
-    Parameters:
-        num_attention_heads (`int`, *optional*, defaults to 16): The number of heads to use for multi-head attention.
-        attention_head_dim (`int`, *optional*, defaults to 88): The number of channels in each head.
-        in_channels (`int`, *optional*):
-            The number of channels in the input and output (specify if the input is **continuous**).
-        num_layers (`int`, *optional*, defaults to 1): The number of layers of Transformer blocks to use.
-        dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
-        cross_attention_dim (`int`, *optional*): The number of `encoder_hidden_states` dimensions to use.
-        sample_size (`int`, *optional*): The width of the latent images (specify if the input is **discrete**).
-            This is fixed during training since it is used to learn a number of position embeddings.
-        num_vector_embeds (`int`, *optional*):
-            The number of classes of the vector embeddings of the latent pixels (specify if the input is **discrete**).
-            Includes the class for the masked latent pixel.
-        activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to use in feed-forward.
-        num_embeds_ada_norm ( `int`, *optional*):
-            The number of diffusion steps used during training. Pass if at least one of the norm_layers is
-            `AdaLayerNorm`. This is fixed during training since it is used to learn a number of embeddings that are
-            added to the hidden states.
-
-            During inference, you can denoise for up to but not more steps than `num_embeds_ada_norm`.
-        attention_bias (`bool`, *optional*):
-            Configure if the `TransformerBlocks` attention should contain a bias parameter.
-    """
-
+class Transformer3DModel(ModelMixin, ConfigMixin):
+    _supports_gradient_checkpointing = True
     @register_to_config
     def __init__(
         self,
@@ -100,6 +72,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         norm_eps: float = 1e-5,
         attention_type: str = "default",
         caption_channels: int = None,
+        unet_use_cross_frame_attention: bool = False,
+        unet_use_temporal_attention: bool = False,
     ):
         super().__init__()
         self.use_linear_projection = use_linear_projection
@@ -110,7 +84,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         conv_cls = nn.Conv2d if USE_PEFT_BACKEND else LoRACompatibleConv
         linear_cls = nn.Linear if USE_PEFT_BACKEND else LoRACompatibleLinear
 
-        # 1. Transformer2DModel can process both standard continuous images of shape `(batch_size, num_channels, width, height)` as well as quantized image embeddings of shape `(batch_size, num_image_vectors)`
+
         # Define whether input is continuous or discrete depending on configuration
         self.is_input_continuous = (in_channels is not None) and (patch_size is None)
         self.is_input_vectorized = num_vector_embeds is not None
@@ -185,7 +159,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         # 3. Define transformers blocks
         self.transformer_blocks = nn.ModuleList(
             [
-                BasicTransformerBlock(
+                TemporalBasicTransformerBlock(
                     inner_dim,
                     num_attention_heads,
                     attention_head_dim,
@@ -195,12 +169,14 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     num_embeds_ada_norm=num_embeds_ada_norm,
                     attention_bias=attention_bias,
                     only_cross_attention=only_cross_attention,
-                    double_self_attention=double_self_attention,
+                    # double_self_attention=double_self_attention,
                     upcast_attention=upcast_attention,
-                    norm_type=norm_type,
-                    norm_elementwise_affine=norm_elementwise_affine,
-                    norm_eps=norm_eps,
-                    attention_type=attention_type,
+                    # norm_type=norm_type,
+                    # norm_elementwise_affine=norm_elementwise_affine,
+                    # norm_eps=norm_eps,
+                    # attention_type=attention_type,
+                    unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+                    unet_use_temporal_attention=unet_use_temporal_attention,
                 )
                 for d in range(num_layers)
             ]
@@ -241,6 +217,11 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
 
         self.gradient_checkpointing = False
 
+    def _set_gradient_checkpointing(self, module, value=False):
+        if hasattr(module, "gradient_checkpointing"):
+            module.gradient_checkpointing = value
+
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -256,10 +237,10 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         return_dict: bool = True,
     ):
         """
-        The [`Transformer2DModel`] forward method.
+        The [`Transformer3DModel`] forward method.
 
         Args:
-            hidden_states (`torch.LongTensor` of shape `(batch size, num latent pixels)` if discrete, `torch.FloatTensor` of shape `(batch size, channel, height, width)` if continuous):
+            hidden_states (`torch.LongTensor` of shape `(batch size, num latent pixels)` if discrete, `torch.FloatTensor` of shape `(batch size, channel, video_length, height, width)` if continuous):
                 Input `hidden_states`.
             encoder_hidden_states ( `torch.FloatTensor` of shape `(batch size, sequence len, embed dims)`, *optional*):
                 Conditional embeddings for cross attention layer. If not given, cross-attention defaults to
@@ -303,6 +284,17 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         # this helps to broadcast it as a bias over attention scores, which will be in one of the following shapes:
         #   [batch,  heads, query_tokens, key_tokens] (e.g. torch sdp attn)
         #   [batch * heads, query_tokens, key_tokens] (e.g. xformers or classic attn)
+        # Input
+        assert (
+            hidden_states.dim() == 5
+        ), f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
+        video_length = hidden_states.shape[2]
+        hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w")
+        if encoder_hidden_states is not None and encoder_hidden_states.shape[0] != hidden_states.shape[0]:
+            encoder_hidden_states = repeat(
+                encoder_hidden_states, "b n c -> (b f) n c", f=video_length
+            )
+        
         if attention_mask is not None and attention_mask.ndim == 2:
             # assume that mask is expressed as:
             #   (1 = keep,      0 = discard)
@@ -321,7 +313,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
 
         # 1. Input
         if self.is_input_continuous:
-            batch, _, height, width = hidden_states.shape
+            batch, channel, height, width = hidden_states.shape
             residual = hidden_states
 
             hidden_states = self.norm(hidden_states)
@@ -378,6 +370,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     cross_attention_kwargs,
                     class_labels,
                     use_reentrant=False,
+                    video_length=video_length,
                 )
             else:
                 hidden_states, spatial_attn_inputs, spatial_attn_idx = block(
@@ -390,6 +383,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     timestep=timestep,
                     cross_attention_kwargs=cross_attention_kwargs,
                     class_labels=class_labels,
+                    video_length=video_length,
                 )
 
         # 3. Output
@@ -446,7 +440,10 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                 shape=(-1, self.out_channels, height * self.patch_size, width * self.patch_size)
             )
 
+        output = rearrange(output, "(b f) c h w -> b c f h w", f=video_length)
+        if not return_dict:
+            return (output,)
         if not return_dict:
             return (output,), spatial_attn_inputs, spatial_attn_idx
 
-        return Transformer2DModelOutput(sample=output), spatial_attn_inputs, spatial_attn_idx
+        return Transformer3DModelOutput(sample=output), spatial_attn_inputs, spatial_attn_idx

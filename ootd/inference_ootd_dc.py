@@ -15,7 +15,7 @@ import pdb
 
 from pipelines_ootd.pipeline_ootd import OotdPipeline
 from pipelines_ootd.unet_garm_2d_condition import UNetGarm2DConditionModel
-from pipelines_ootd.unet_vton_2d_condition import UNetVton2DConditionModel
+from OOTDiffusion.ootd.pipelines_ootd.unet_vton_3d_condition import UNetVton3DConditionModel
 from diffusers import UniPCMultistepScheduler
 from diffusers import AutoencoderKL
 

@@ -15,7 +15,7 @@ import pdb
 
 from pipelines_ootd.pipeline_ootd import OotdPipeline
 from pipelines_ootd.unet_garm_2d_condition import UNetGarm2DConditionModel
-from pipelines_ootd.unet_vton_2d_condition import UNetVton2DConditionModel
+from OOTDiffusion.ootd.pipelines_ootd.unet_vton_3d_condition import UNetVton3DConditionModel
 from diffusers import UniPCMultistepScheduler
 from diffusers import AutoencoderKL
 
@@ -46,11 +46,14 @@ class OOTDiffusionHD:
             torch_dtype=torch.float16,
             use_safetensors=True,
         )
-        unet_vton = UNetVton2DConditionModel.from_pretrained(
+        unet_vton = UNetVton3DConditionModel.from_pretrained_2d(
             UNET_PATH,
             subfolder="unet_vton",
-            torch_dtype=torch.float16,
-            use_safetensors=True,
+            motion_module_path="",
+            unet_additional_kwargs={
+                "use_motion_module": False,
+                "unet_use_temporal_attention": False,
+            },
         )
 
         self.pipe = OotdPipeline.from_pretrained(

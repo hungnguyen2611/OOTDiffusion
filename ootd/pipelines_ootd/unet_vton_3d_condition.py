@@ -15,15 +15,19 @@
 # Modified by Yuhao Xu for OOTDiffusion (https://github.com/levihsu/OOTDiffusion)
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+from os import PathLike
+from collections import OrderedDict
+from safetensors.torch import load_file
+from diffusers.utils import SAFETENSORS_WEIGHTS_NAME, WEIGHTS_NAME, BaseOutput, logging
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
-
-from .unet_vton_2d_blocks import (
-    UNetMidBlock2D,
-    UNetMidBlock2DCrossAttn,
-    UNetMidBlock2DSimpleCrossAttn,
+from pathlib import Path
+from .resnet import InflatedConv3d, InflatedGroupNorm
+from .unet_vton_3d_blocks import (
+    UNetMidBlock3D,
+    UNetMidBlock3DCrossAttn,
+    UNetMidBlock3DSimpleCrossAttn,
     get_down_block,
     get_up_block,
 )
@@ -65,111 +69,11 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 @dataclass
-class UNet2DConditionOutput(BaseOutput):
-    """
-    The output of [`UNet2DConditionModel`].
-
-    Args:
-        sample (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
-            The hidden states output conditioned on `encoder_hidden_states` input. Output of last layer of model.
-    """
-
+class UNet3DConditionOutput(BaseOutput):
     sample: torch.FloatTensor = None
 
 
-class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
-    r"""
-    A conditional 2D UNet model that takes a noisy sample, conditional state, and a timestep and returns a sample
-    shaped output.
-
-    This model inherits from [`ModelMixin`]. Check the superclass documentation for it's generic methods implemented
-    for all models (such as downloading or saving).
-
-    Parameters:
-        sample_size (`int` or `Tuple[int, int]`, *optional*, defaults to `None`):
-            Height and width of input/output sample.
-        in_channels (`int`, *optional*, defaults to 4): Number of channels in the input sample.
-        out_channels (`int`, *optional*, defaults to 4): Number of channels in the output.
-        center_input_sample (`bool`, *optional*, defaults to `False`): Whether to center the input sample.
-        flip_sin_to_cos (`bool`, *optional*, defaults to `False`):
-            Whether to flip the sin to cos in the time embedding.
-        freq_shift (`int`, *optional*, defaults to 0): The frequency shift to apply to the time embedding.
-        down_block_types (`Tuple[str]`, *optional*, defaults to `("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D")`):
-            The tuple of downsample blocks to use.
-        mid_block_type (`str`, *optional*, defaults to `"UNetMidBlock2DCrossAttn"`):
-            Block type for middle of UNet, it can be one of `UNetMidBlock2DCrossAttn`, `UNetMidBlock2D`, or
-            `UNetMidBlock2DSimpleCrossAttn`. If `None`, the mid block layer is skipped.
-        up_block_types (`Tuple[str]`, *optional*, defaults to `("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D")`):
-            The tuple of upsample blocks to use.
-        only_cross_attention(`bool` or `Tuple[bool]`, *optional*, default to `False`):
-            Whether to include self-attention in the basic transformer blocks, see
-            [`~models.attention.BasicTransformerBlock`].
-        block_out_channels (`Tuple[int]`, *optional*, defaults to `(320, 640, 1280, 1280)`):
-            The tuple of output channels for each block.
-        layers_per_block (`int`, *optional*, defaults to 2): The number of layers per block.
-        downsample_padding (`int`, *optional*, defaults to 1): The padding to use for the downsampling convolution.
-        mid_block_scale_factor (`float`, *optional*, defaults to 1.0): The scale factor to use for the mid block.
-        dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
-        act_fn (`str`, *optional*, defaults to `"silu"`): The activation function to use.
-        norm_num_groups (`int`, *optional*, defaults to 32): The number of groups to use for the normalization.
-            If `None`, normalization and activation layers is skipped in post-processing.
-        norm_eps (`float`, *optional*, defaults to 1e-5): The epsilon to use for the normalization.
-        cross_attention_dim (`int` or `Tuple[int]`, *optional*, defaults to 1280):
-            The dimension of the cross attention features.
-        transformer_layers_per_block (`int`, `Tuple[int]`, or `Tuple[Tuple]` , *optional*, defaults to 1):
-            The number of transformer blocks of type [`~models.attention.BasicTransformerBlock`]. Only relevant for
-            [`~models.unet_2d_blocks.CrossAttnDownBlock2D`], [`~models.unet_2d_blocks.CrossAttnUpBlock2D`],
-            [`~models.unet_2d_blocks.UNetMidBlock2DCrossAttn`].
-       reverse_transformer_layers_per_block : (`Tuple[Tuple]`, *optional*, defaults to None):
-            The number of transformer blocks of type [`~models.attention.BasicTransformerBlock`], in the upsampling
-            blocks of the U-Net. Only relevant if `transformer_layers_per_block` is of type `Tuple[Tuple]` and for
-            [`~models.unet_2d_blocks.CrossAttnDownBlock2D`], [`~models.unet_2d_blocks.CrossAttnUpBlock2D`],
-            [`~models.unet_2d_blocks.UNetMidBlock2DCrossAttn`].
-        encoder_hid_dim (`int`, *optional*, defaults to None):
-            If `encoder_hid_dim_type` is defined, `encoder_hidden_states` will be projected from `encoder_hid_dim`
-            dimension to `cross_attention_dim`.
-        encoder_hid_dim_type (`str`, *optional*, defaults to `None`):
-            If given, the `encoder_hidden_states` and potentially other embeddings are down-projected to text
-            embeddings of dimension `cross_attention` according to `encoder_hid_dim_type`.
-        attention_head_dim (`int`, *optional*, defaults to 8): The dimension of the attention heads.
-        num_attention_heads (`int`, *optional*):
-            The number of attention heads. If not defined, defaults to `attention_head_dim`
-        resnet_time_scale_shift (`str`, *optional*, defaults to `"default"`): Time scale shift config
-            for ResNet blocks (see [`~models.resnet.ResnetBlock2D`]). Choose from `default` or `scale_shift`.
-        class_embed_type (`str`, *optional*, defaults to `None`):
-            The type of class embedding to use which is ultimately summed with the time embeddings. Choose from `None`,
-            `"timestep"`, `"identity"`, `"projection"`, or `"simple_projection"`.
-        addition_embed_type (`str`, *optional*, defaults to `None`):
-            Configures an optional embedding which will be summed with the time embeddings. Choose from `None` or
-            "text". "text" will use the `TextTimeEmbedding` layer.
-        addition_time_embed_dim: (`int`, *optional*, defaults to `None`):
-            Dimension for the timestep embeddings.
-        num_class_embeds (`int`, *optional*, defaults to `None`):
-            Input dimension of the learnable embedding matrix to be projected to `time_embed_dim`, when performing
-            class conditioning with `class_embed_type` equal to `None`.
-        time_embedding_type (`str`, *optional*, defaults to `positional`):
-            The type of position embedding to use for timesteps. Choose from `positional` or `fourier`.
-        time_embedding_dim (`int`, *optional*, defaults to `None`):
-            An optional override for the dimension of the projected time embedding.
-        time_embedding_act_fn (`str`, *optional*, defaults to `None`):
-            Optional activation function to use only once on the time embeddings before they are passed to the rest of
-            the UNet. Choose from `silu`, `mish`, `gelu`, and `swish`.
-        timestep_post_act (`str`, *optional*, defaults to `None`):
-            The second activation function to use in timestep embedding. Choose from `silu`, `mish` and `gelu`.
-        time_cond_proj_dim (`int`, *optional*, defaults to `None`):
-            The dimension of `cond_proj` layer in the timestep embedding.
-        conv_in_kernel (`int`, *optional*, default to `3`): The kernel size of `conv_in` layer. conv_out_kernel (`int`,
-        *optional*, default to `3`): The kernel size of `conv_out` layer. projection_class_embeddings_input_dim (`int`,
-        *optional*): The dimension of the `class_labels` input when
-            `class_embed_type="projection"`. Required when `class_embed_type="projection"`.
-        class_embeddings_concat (`bool`, *optional*, defaults to `False`): Whether to concatenate the time
-            embeddings with the class embeddings.
-        mid_block_only_cross_attention (`bool`, *optional*, defaults to `None`):
-            Whether to use cross attention with the mid block when using the `UNetMidBlock2DSimpleCrossAttn`. If
-            `only_cross_attention` is given as a single boolean and `mid_block_only_cross_attention` is `None`, the
-            `only_cross_attention` value is used as the value for `mid_block_only_cross_attention`. Default to `False`
-            otherwise.
-    """
+class UNetVton3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
 
     _supports_gradient_checkpointing = True
 
@@ -183,13 +87,13 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
         flip_sin_to_cos: bool = True,
         freq_shift: int = 0,
         down_block_types: Tuple[str] = (
-            "CrossAttnDownBlock2D",
-            "CrossAttnDownBlock2D",
-            "CrossAttnDownBlock2D",
-            "DownBlock2D",
+            "CrossAttnDownBlock3D",
+            "CrossAttnDownBlock3D",
+            "CrossAttnDownBlock3D",
+            "DownBlock3D",
         ),
-        mid_block_type: Optional[str] = "UNetMidBlock2DCrossAttn",
-        up_block_types: Tuple[str] = ("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
+        mid_block_type: Optional[str] = "UNetMidBlock3DCrossAttn",
+        up_block_types: Tuple[str] = ("UpBlock3D", "CrossAttnUpBlock3D", "CrossAttnUpBlock3D", "CrossAttnUpBlock3D"),
         only_cross_attention: Union[bool, Tuple[bool]] = False,
         block_out_channels: Tuple[int] = (320, 640, 1280, 1280),
         layers_per_block: Union[int, Tuple[int]] = 2,
@@ -229,6 +133,16 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
         mid_block_only_cross_attention: Optional[bool] = None,
         cross_attention_norm: Optional[str] = None,
         addition_embed_type_num_heads=64,
+        # Additional
+        use_inflated_groupnorm=False,
+        use_motion_module=False,
+        motion_module_resolutions=(1, 2, 4, 8),
+        motion_module_mid_block=False,
+        motion_module_decoder_only=False,
+        motion_module_type=None,
+        motion_module_kwargs={},
+        unet_use_cross_frame_attention=None,
+        unet_use_temporal_attention=None,
     ):
         super().__init__()
 
@@ -289,8 +203,8 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
 
         # input
         conv_in_padding = (conv_in_kernel - 1) // 2
-        self.conv_in = nn.Conv2d(
-            in_channels, block_out_channels[0], kernel_size=conv_in_kernel, padding=conv_in_padding
+        self.conv_in = InflatedConv3d(
+            in_channels, block_out_channels[0], kernel_size=3, padding=conv_in_padding
         )
 
         # time
@@ -454,6 +368,7 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
         # down
         output_channel = block_out_channels[0]
         for i, down_block_type in enumerate(down_block_types):
+            res = 2**i
             input_channel = output_channel
             output_channel = block_out_channels[i]
             is_final_block = i == len(block_out_channels) - 1
@@ -483,12 +398,20 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
                 cross_attention_norm=cross_attention_norm,
                 attention_head_dim=attention_head_dim[i] if attention_head_dim[i] is not None else output_channel,
                 dropout=dropout,
+                unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+                unet_use_temporal_attention=unet_use_temporal_attention,
+                use_inflated_groupnorm=use_inflated_groupnorm,
+                use_motion_module=use_motion_module
+                and (res in motion_module_resolutions)
+                and (not motion_module_decoder_only),
+                motion_module_type=motion_module_type,
+                motion_module_kwargs=motion_module_kwargs,
             )
             self.down_blocks.append(down_block)
 
         # mid
-        if mid_block_type == "UNetMidBlock2DCrossAttn":
-            self.mid_block = UNetMidBlock2DCrossAttn(
+        if mid_block_type == "UNetMidBlock3DCrossAttn":
+            self.mid_block = UNetMidBlock3DCrossAttn(
                 transformer_layers_per_block=transformer_layers_per_block[-1],
                 in_channels=block_out_channels[-1],
                 temb_channels=blocks_time_embed_dim,
@@ -504,9 +427,15 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
                 use_linear_projection=use_linear_projection,
                 upcast_attention=upcast_attention,
                 attention_type=attention_type,
+                unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+                unet_use_temporal_attention=unet_use_temporal_attention,
+                use_inflated_groupnorm=use_inflated_groupnorm,
+                use_motion_module=use_motion_module and motion_module_mid_block,
+                motion_module_type=motion_module_type,
+                motion_module_kwargs=motion_module_kwargs,
             )
-        elif mid_block_type == "UNetMidBlock2DSimpleCrossAttn":
-            self.mid_block = UNetMidBlock2DSimpleCrossAttn(
+        elif mid_block_type == "UNetMidBlock3DSimpleCrossAttn":
+            self.mid_block = UNetMidBlock3DSimpleCrossAttn(
                 in_channels=block_out_channels[-1],
                 temb_channels=blocks_time_embed_dim,
                 dropout=dropout,
@@ -520,9 +449,15 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
                 skip_time_act=resnet_skip_time_act,
                 only_cross_attention=mid_block_only_cross_attention,
                 cross_attention_norm=cross_attention_norm,
+                unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+                unet_use_temporal_attention=unet_use_temporal_attention,
+                use_inflated_groupnorm=use_inflated_groupnorm,
+                use_motion_module=use_motion_module and motion_module_mid_block,
+                motion_module_type=motion_module_type,
+                motion_module_kwargs=motion_module_kwargs,
             )
-        elif mid_block_type == "UNetMidBlock2D":
-            self.mid_block = UNetMidBlock2D(
+        elif mid_block_type == "UNetMidBlock3D":
+            self.mid_block = UNetMidBlock3D(
                 in_channels=block_out_channels[-1],
                 temb_channels=blocks_time_embed_dim,
                 dropout=dropout,
@@ -533,6 +468,12 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
                 resnet_groups=norm_num_groups,
                 resnet_time_scale_shift=resnet_time_scale_shift,
                 add_attention=False,
+                unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+                unet_use_temporal_attention=unet_use_temporal_attention,
+                use_inflated_groupnorm=use_inflated_groupnorm,
+                use_motion_module=use_motion_module and motion_module_mid_block,
+                motion_module_type=motion_module_type,
+                motion_module_kwargs=motion_module_kwargs,
             )
         elif mid_block_type is None:
             self.mid_block = None
@@ -556,6 +497,7 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
 
         output_channel = reversed_block_out_channels[0]
         for i, up_block_type in enumerate(up_block_types):
+            res = 2 ** (3 - i)
             is_final_block = i == len(block_out_channels) - 1
 
             prev_output_channel = output_channel
@@ -595,16 +537,31 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
                 cross_attention_norm=cross_attention_norm,
                 attention_head_dim=attention_head_dim[i] if attention_head_dim[i] is not None else output_channel,
                 dropout=dropout,
+                unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+                unet_use_temporal_attention=unet_use_temporal_attention,
+                use_inflated_groupnorm=use_inflated_groupnorm,
+                use_motion_module=use_motion_module
+                and (res in motion_module_resolutions),
+                motion_module_type=motion_module_type,
+                motion_module_kwargs=motion_module_kwargs,
             )
             self.up_blocks.append(up_block)
             prev_output_channel = output_channel
 
         # out
         if norm_num_groups is not None:
-            self.conv_norm_out = nn.GroupNorm(
-                num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=norm_eps
-            )
-
+            if use_inflated_groupnorm:
+                self.conv_norm_out = InflatedGroupNorm(
+                    num_channels=block_out_channels[0],
+                    num_groups=norm_num_groups,
+                    eps=norm_eps,
+                )
+            else:
+                self.conv_norm_out = nn.GroupNorm(
+                    num_channels=block_out_channels[0],
+                    num_groups=norm_num_groups,
+                    eps=norm_eps,
+                )
             self.conv_act = get_activation(act_fn)
 
         else:
@@ -612,7 +569,7 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
             self.conv_act = None
 
         conv_out_padding = (conv_out_kernel - 1) // 2
-        self.conv_out = nn.Conv2d(
+        self.conv_out = InflatedConv3d(
             block_out_channels[0], out_channels, kernel_size=conv_out_kernel, padding=conv_out_padding
         )
 
@@ -820,7 +777,7 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
         down_intrablock_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
-    ) -> Union[UNet2DConditionOutput, Tuple]:
+    ) -> Union[UNet3DConditionOutput, Tuple]:
         r"""
         The [`UNet2DConditionModel`] forward method.
 
@@ -1180,4 +1137,99 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
         if not return_dict:
             return (sample,)
 
-        return UNet2DConditionOutput(sample=sample)
+        return UNet3DConditionOutput(sample=sample)
+    
+
+    @classmethod
+    def from_pretrained_2d(
+        cls,
+        pretrained_model_path: PathLike,
+        motion_module_path: PathLike,
+        subfolder=None,
+        unet_additional_kwargs=None,
+        mm_zero_proj_out=False,
+    ):
+        pretrained_model_path = Path(pretrained_model_path)
+        motion_module_path = Path(motion_module_path)
+        if subfolder is not None:
+            pretrained_model_path = pretrained_model_path.joinpath(subfolder)
+        logger.info(
+            f"loaded temporal unet's pretrained weights from {pretrained_model_path} ..."
+        )
+
+        config_file = pretrained_model_path / "config.json"
+        if not (config_file.exists() and config_file.is_file()):
+            raise RuntimeError(f"{config_file} does not exist or is not a file")
+
+        unet_config = cls.load_config(config_file)
+        unet_config["_class_name"] = cls.__name__
+        unet_config["down_block_types"] = [
+            "CrossAttnDownBlock3D",
+            "CrossAttnDownBlock3D",
+            "CrossAttnDownBlock3D",
+            "DownBlock3D",
+        ]
+        
+        unet_config["up_block_types"] = [
+            "UpBlock3D",
+            "CrossAttnUpBlock3D",
+            "CrossAttnUpBlock3D",
+            "CrossAttnUpBlock3D",
+        ]
+        unet_config["mid_block_type"] = "UNetMidBlock3DCrossAttn"
+
+        model = cls.from_config(unet_config, **unet_additional_kwargs)
+        # load the vanilla weights
+        if pretrained_model_path.joinpath(SAFETENSORS_WEIGHTS_NAME).exists():
+            logger.debug(
+                f"loading safeTensors weights from {pretrained_model_path} ..."
+            )
+            state_dict = load_file(
+                pretrained_model_path.joinpath(SAFETENSORS_WEIGHTS_NAME), device="cpu"
+            )
+
+        elif pretrained_model_path.joinpath(WEIGHTS_NAME).exists():
+            logger.debug(f"loading weights from {pretrained_model_path} ...")
+            state_dict = torch.load(
+                pretrained_model_path.joinpath(WEIGHTS_NAME),
+                map_location="cpu",
+                weights_only=True,
+            )
+        else:
+            raise FileNotFoundError(f"no weights file found in {pretrained_model_path}")
+
+        # load the motion module weights
+        if motion_module_path.exists() and motion_module_path.is_file():
+            if motion_module_path.suffix.lower() in [".pth", ".pt", ".ckpt"]:
+                logger.info(f"Load motion module params from {motion_module_path}")
+                motion_state_dict = torch.load(
+                    motion_module_path, map_location="cpu", weights_only=True
+                )
+            elif motion_module_path.suffix.lower() == ".safetensors":
+                motion_state_dict = load_file(motion_module_path, device="cpu")
+            else:
+                raise RuntimeError(
+                    f"unknown file format for motion module weights: {motion_module_path.suffix}"
+                )
+            if mm_zero_proj_out:
+                logger.info(f"Zero initialize proj_out layers in motion module...")
+                new_motion_state_dict = OrderedDict()
+                for k in motion_state_dict:
+                    if "proj_out" in k:
+                        continue
+                    new_motion_state_dict[k] = motion_state_dict[k]
+                motion_state_dict = new_motion_state_dict
+
+            # merge the state dicts
+            state_dict.update(motion_state_dict)
+
+        # load the weights into the model
+        m, u = model.load_state_dict(state_dict, strict=False)
+        logger.debug(f"### missing keys: {len(m)}; \n### unexpected keys: {len(u)};")
+
+        params = [
+            p.numel() if "temporal" in n else 0 for n, p in model.named_parameters()
+        ]
+        logger.info(f"Loaded {sum(params) / 1e6}M-parameter motion module")
+
+        return model

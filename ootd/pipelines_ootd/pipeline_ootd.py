@@ -24,7 +24,7 @@ from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 
 from transformers import AutoProcessor, CLIPVisionModelWithProjection
 
-from .unet_vton_2d_condition import UNetVton2DConditionModel
+from .unet_vton_3d_condition import UNetVton2DConditionModel
 from .unet_garm_2d_condition import UNetGarm2DConditionModel
 
 from diffusers.configuration_utils import FrozenDict
